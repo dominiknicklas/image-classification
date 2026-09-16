@@ -1,0 +1,15 @@
+# datasets (downloaded on first run)
+src/data/
+data/
+
+# checkpoints
+*.pt
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.python-version
+
+# macOS
+.DS_Store
