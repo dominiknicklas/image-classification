@@ -6,16 +6,12 @@ an M2 Pro. See the README for the ablation the configuration came out of.
 Writes best.pt and three PNGs to ../results/.
 """
 
-import matplotlib
-
-matplotlib.use("Agg")  # save PNGs without needing a display backend
-
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
+
+from helper import plot_confusion_matrix, plot_loss, plot_misclassified
 
 # ----------------------------------------------------------------------
 # Hyperparameters - the only place to tune
@@ -187,100 +183,6 @@ def print_worst_classes(matrix, class_names, n=10):
         print(f"  {value:6.1%} | {class_names[index]}")
 
 
-def denormalize(images, mean, std):
-    """Undo Normalize so imshow shows the original colours."""
-    shape = (1, -1, 1, 1)
-    return (images * std.view(shape) + mean.view(shape)).clamp(0, 1)
-
-
-def plot_loss(history, batch_losses, steps_per_epoch, path):
-    """Left: loss per batch with a moving average. Right: per-epoch loss and accuracy."""
-    fig, (ax_batch, ax_epoch) = plt.subplots(1, 2, figsize=(13, 4.5))
-
-    ax_batch.plot(batch_losses, lw=0.6, alpha=0.3, label="loss per batch")
-    window = 50
-    if len(batch_losses) >= window:
-        moving_avg = np.convolve(batch_losses, np.ones(window) / window, mode="valid")
-        ax_batch.plot(range(window - 1, len(batch_losses)), moving_avg, lw=2,
-                      label=f"moving average ({window} batches)")
-    for epoch in range(1, len(history)):
-        ax_batch.axvline(epoch * steps_per_epoch, color="gray", ls=":", lw=0.7)
-    ax_batch.set(xlabel="batch step", ylabel="cross-entropy loss",
-                 title="Training loss per batch")
-    ax_batch.legend()
-
-    epochs = range(1, len(history) + 1)
-    ax_epoch.plot(epochs, [h["train_loss"] for h in history], label="train loss")
-    ax_epoch.plot(epochs, [h["val_loss"] for h in history], label="val loss")
-    ax_epoch.set(xlabel="epoch", ylabel="cross-entropy loss",
-                 title="Loss and accuracy per epoch")
-    ax_epoch.legend(loc="upper left")
-
-    # Accuracy shares the x-axis but needs its own scale.
-    ax_acc = ax_epoch.twinx()
-    ax_acc.plot(epochs, [h["train_acc"] for h in history], ls="--",
-                color="tab:green", label="train accuracy")
-    ax_acc.plot(epochs, [h["val_acc"] for h in history], ls="--",
-                color="tab:red", label="val accuracy")
-    ax_acc.set_ylabel("accuracy")
-    ax_acc.legend(loc="lower right")
-
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print("written:", path)
-
-
-def plot_confusion_matrix(matrix, class_names, path):
-    """Row-normalised heatmap: every row sums to 1, the diagonal is per-class recall."""
-    normalised = matrix.float() / matrix.sum(dim=1, keepdim=True).clamp(min=1)
-
-    fig, ax = plt.subplots(figsize=(14, 13))
-    image = ax.imshow(normalised, cmap="viridis", vmin=0, vmax=1, interpolation="nearest")
-    fig.colorbar(image, ax=ax, fraction=0.046, label="fraction of the true class")
-
-    ax.set_xticks(range(len(class_names)))
-    ax.set_yticks(range(len(class_names)))
-    ax.set_xticklabels(class_names, rotation=90, fontsize=4)
-    ax.set_yticklabels(class_names, fontsize=4)
-    ax.set(xlabel="predicted class", ylabel="true class",
-           title="Confusion matrix (row-normalised)")
-
-    fig.tight_layout()
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-    print("written:", path)
-
-
-def plot_misclassified(images, labels, preds, class_names, mean, std, path, n=64):
-    """Show n randomly sampled errors in an 8x8 grid, titled 'truth -> prediction'."""
-    if len(images) == 0:
-        print("no misclassified images - skipping plot")
-        return
-
-    generator = torch.Generator().manual_seed(SEED)
-    sample = torch.randperm(len(images), generator=generator)[:n]
-    # (C,H,W) -> (H,W,C), because that is the layout imshow expects.
-    shown = denormalize(images[sample], mean, std).permute(0, 2, 3, 1).numpy()
-
-    fig, axes = plt.subplots(8, 8, figsize=(12, 13))
-    for ax in axes.flat:
-        ax.axis("off")
-
-    for ax, idx, image in zip(axes.flat, sample.tolist(), shown):
-        # "nearest" keeps the 32x32 pixels as hard blocks instead of blurring
-        # them: CIFAR has no more detail than this, so smoothing only invents it.
-        ax.imshow(image, interpolation="nearest")
-        ax.set_title(f"True: {class_names[labels[idx]]}\n- Pred: {class_names[preds[idx]]}",
-                     fontsize=7, color="firebrick")
-
-    fig.suptitle(f"{len(shown)} of {len(images)} misclassified test images", fontsize=14)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print("written:", path)
-
-
 # ----------------------------------------------------------------------
 # Main functionality, utilazing the helper functions
 # ----------------------------------------------------------------------
@@ -387,9 +289,14 @@ if __name__ == "__main__":
     print_worst_classes(matrix, class_names)
 
     # --- plots ---
-    plot_loss(history, batch_losses, len(train_dl), f"{OUT_DIR}/{PREFIX}_loss.png")
-    plot_confusion_matrix(matrix, class_names, f"{OUT_DIR}/{PREFIX}_confusion_matrix.png")
+    plot_loss(history, batch_losses, len(train_dl), f"{OUT_DIR}/{PREFIX}_loss.png",
+              eval_split="val")
+    # A hundred classes: no counts in the cells, bigger canvas, smaller labels.
+    plot_confusion_matrix(matrix, class_names, f"{OUT_DIR}/{PREFIX}_confusion_matrix.png",
+                          show_counts=False, figsize=(14, 13), tick_fontsize=4, dpi=200)
 
     mis_images, mis_labels, mis_preds = collect_misclassified(model, test_dl, device)
     plot_misclassified(mis_images, mis_labels, mis_preds, class_names, mean, std,
-                       f"{OUT_DIR}/{PREFIX}_misclassified.png")
+                       f"{OUT_DIR}/{PREFIX}_misclassified.png", seed=SEED,
+                       figsize=(12, 13), title="True: {true}\n- Pred: {pred}",
+                       title_fontsize=7)

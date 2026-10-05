@@ -1,13 +1,165 @@
 # Image classification from scratch: MNIST and CIFAR-100
 
-Three PyTorch training scripts, written to learn how convolutional networks
-behave rather than to chase a benchmark. Every model is trained from scratch on
-a MacBook (M2 Pro, MPS), no pretrained weights anywhere.
+Two parts. The first trains an MLP on MNIST without any deep learning framework:
+forward pass, backpropagation and SGD run on a scalar autograd engine written by
+hand, and the result is compared against the same network in PyTorch. The second
+is three PyTorch training scripts, written to learn how convolutional networks
+behave rather than to chase a benchmark.
 
-The CIFAR-100 part is the interesting one: four controlled runs that isolate
-what longer training, augmentation and model capacity each contribute.
+Every model is trained from scratch on a MacBook (M2 Pro), no pretrained weights
+anywhere.
 
-## Results
+## Part 1: an MLP without a deep learning framework
+
+`src/mnist_mlp_micrograd.py` classifies MNIST with a 784-128-10 network and
+reaches 97.90 % test accuracy. Nothing in the computation comes from PyTorch or
+NumPy. The imports are `math` and `random`, plus `struct` and `gzip` to read the
+MNIST files. Matplotlib is only used afterwards, for the figures.
+
+### The engine
+
+`src/micrograd.py` started as the notebook `src/micrograd.ipynb`, in which I
+followed Andrej Karpathy's micrograd lecture. Its core is one class, `Value`. A
+`Value` holds a number, its gradient, the values it was computed from, and a
+small function that knows how to pass a gradient back to them:
+
+```python
+def __mul__(self, other):
+    other = other if isinstance(other, Value) else Value(other)
+    out = Value(self.data * other.data, (self, other), '*')
+
+    def _backward():
+        self.grad += other.data * out.grad
+        other.grad += self.data * out.grad
+
+    out._backward = _backward
+    return out
+```
+
+Every operation works like this, so computing a loss builds a graph of `Value`
+objects as a side effect. `loss.backward()` sorts that graph topologically and
+calls each `_backward` from the loss down to the weights. That is the chain rule
+and nothing else.
+
+On top of `Value` sit `Neuron`, `Layer` and `MLP`, a `cross_entropy` loss and an
+`SGD` class with `zero_grad()` and `step()`.
+
+### What MNIST needed beyond the notebook
+
+The notebook trains a 3-4-4-1 network with tanh on four data points. For MNIST
+the engine needed more:
+
+- `relu` for the hidden layer, and `log` for the loss.
+- Softmax with cross-entropy, built from `exp` and `log` as
+  `log(sum_j exp(z_j)) - z_target`. The largest logit is subtracted first.
+  Softmax does not change under that shift, and `exp` can no longer overflow.
+- The same weight initialisation as `torch.nn.Linear`, uniform in
+  ±1/sqrt(fan_in). The notebook draws from ±1, and with a different start the
+  comparison against PyTorch would not be fair.
+- An iterative topological sort. The recursive one from the notebook hits
+  Python's recursion limit on graphs this deep.
+- `MLP.predict`, a forward pass on plain floats that builds no graph. It is used
+  for evaluation and plays the role of `torch.no_grad()`.
+
+Two bugs from the notebook surfaced along the way. `__pow__` assigned the
+gradient with `=` where it has to accumulate with `+=`, and `Value - Value`
+crashed because `__neg__` was missing.
+
+### One training step
+
+MNIST is read straight from the IDX files: a 16-byte header, then 784 bytes per
+image. A byte has only 256 possible values, so normalising with the training
+mean and standard deviation (0.1307 and 0.3081) is a lookup in a table of 256
+floats.
+
+A mini-batch of 64 images becomes 64 separate graphs that share the same weight
+`Value`s. Their losses are averaged into one `Value`, and a single `backward()`
+call fills the gradient of every weight with the batch mean:
+
+```python
+losses = []
+for index in batch:
+    pixels = [table[byte] for byte in images[index]]
+    logits = model(pixels)
+    losses.append(cross_entropy(logits, labels[index]))
+loss = sum(losses[1:], losses[0]) * (1 / len(batch))
+
+optimizer.zero_grad()
+loss.backward()
+optimizer.step()
+```
+
+### The speed problem
+
+A purely scalar engine does not get through MNIST. Built from single `*` and `+`
+nodes, the first layer alone needs 784 × 128 multiplications and as many
+additions, so one image creates about 200,000 `Value` objects. I measured 0.6 s
+per image for forward and backward. Five epochs over 60,000 images would have
+taken 50 hours.
+
+`Value.weighted_sum` is the one place where the engine leaves the scalar idea.
+It computes `sum(w_i * x_i) + b` as a single node with its own backward rule:
+
+```python
+def _backward():
+    grad = out.grad
+    if grad == 0.0:
+        return  # e.g. behind a ReLU that is switched off: nothing to add
+    for w, x in zip(weights, xs):
+        w.grad += x * grad
+    ...
+    bias.grad += grad
+```
+
+One image now takes about 300 nodes and 10 ms. Every weight is still its own
+`Value`, and the gradients are identical to the ones from single nodes.
+
+### Result
+
+Architecture, loss, learning rate (0.1), batch size (64) and epoch count (5) are
+the same as in `src/mnist_mlp.py`.
+
+| | PyTorch | micrograd |
+|---|---|---|
+| Parameters | 101,770 | 101,770 |
+| Test accuracy | 97.77 % | 97.90 % |
+| Errors out of 10,000 | 223 | 210 |
+| Training time, 5 epochs | under a minute | 53 minutes |
+
+| Epoch | Train loss | Train accuracy | Test loss | Test accuracy |
+|---|---|---|---|---|
+| 1 | 0.259 | 92.30 % | 0.138 | 95.66 % |
+| 2 | 0.113 | 96.68 % | 0.120 | 96.13 % |
+| 3 | 0.080 | 97.58 % | 0.091 | 97.05 % |
+| 4 | 0.061 | 98.16 % | 0.081 | 97.49 % |
+| 5 | 0.048 | 98.58 % | 0.069 | 97.90 % |
+
+![Training loss per batch, loss and accuracy per epoch](results/mnist_mlp_micrograd_loss.png)
+
+The 13 errors between the two versions say nothing about the implementations.
+Initial weights and batch order come from different random number generators,
+and there is one seed each. The gradients themselves were compared directly:
+for the same weights and the same batch of 8 inputs, micrograd and PyTorch
+(float64) differ by at most 1.7e-16.
+
+The most frequent confusion is 9 predicted as 4, 12 times, with 4 predicted as
+9 right behind at 9. The confusion matrix and 64 of the misclassified digits are
+in `results/mnist_mlp_micrograd_*.png`.
+
+```bash
+cd src
+uv run python mnist_mlp_micrograd.py
+```
+
+Setting `TRAIN_SIZE` and `TEST_SIZE` at the top of the script to something like
+3,200 and 1,000 gives a test run of about three minutes.
+
+## Part 2: PyTorch on MNIST and CIFAR-100
+
+The CIFAR-100 part is the interesting one here: four controlled runs that
+isolate what longer training, augmentation and model capacity each contribute.
+
+### Results
 
 | Script | Dataset | Parameters | Test accuracy |
 |---|---|---|---|
@@ -24,7 +176,7 @@ is why error counts are the more honest number this far up the scale.
 The CIFAR-100 run takes about 52 minutes on an M2 Pro, roughly 21 seconds per
 epoch.
 
-## The CIFAR-100 ablation
+### The CIFAR-100 ablation
 
 Each row changes one thing against the row above it.
 
@@ -55,7 +207,7 @@ Caveat: one seed per configuration. I never measured how much two runs of the
 same configuration differ, so the +0.23 in run D is probably noise, and the
 larger deltas are likely but not provably real.
 
-## What the errors look like
+### What the errors look like
 
 Every run prints its most frequent confusions and writes a confusion matrix to
 `results/`.
@@ -122,11 +274,16 @@ what a small VGG-style network gets on a laptop.
 ├── pyproject.toml
 ├── uv.lock
 ├── src/
+│   ├── helper.py                # matplotlib figures shared by all scripts
 │   ├── mnist_mlp.py
 │   ├── mnist_cnn.py
-│   └── cifar100_cnn.py
+│   ├── cifar100_cnn.py
+│   ├── micrograd.py             # autograd engine, MLP, loss, SGD
+│   ├── micrograd.ipynb
+│   └── mnist_mlp_micrograd.py
 └── results/
     ├── mnist_mlp_*.png
+    ├── mnist_mlp_micrograd_*.png
     ├── mnist_cnn_*.png
     └── cifar100_*.png
 ```
